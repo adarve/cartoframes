@@ -9,7 +9,12 @@ from carto.exceptions import CartoRateLimitException
 from pandas import DataFrame
 from geopandas import GeoDataFrame
 from cartoframes.auth import Credentials
-from cartoframes.io.managers.context_manager import ContextManager, DEFAULT_RETRY_TIMES, retry_copy
+from cartoframes.io.managers.context_manager import (
+    ContextManager,
+    DEFAULT_RETRY_TIMES,
+    _alter_table_drop_add_columns_query,
+    retry_copy
+)
 from cartoframes.utils.columns import ColumnInfo
 
 
@@ -304,3 +309,70 @@ class TestContextManager(object):
 
         # Then
         mock.assert_called_with("SELECT CDB_CartodbfyTable('schema', '__new_table_name__')")
+
+    def test_truncate_drop_add_columns_builds_query_without_double_semicolon(self, mocker):
+        # Given
+        mocker.patch('cartoframes.io.managers.context_manager._create_auth_client')
+        mocker.patch.object(ContextManager, '_check_regenerate_table_exists', return_value=True)
+        mock = mocker.patch.object(ContextManager, 'execute_long_running_query')
+        df_columns = [
+            ColumnInfo('SET', 'set', 'text', False),
+            ColumnInfo('SET2', 'set2', 'text', False)
+        ]
+        table_columns = [
+            ColumnInfo('SET', 'set', 'text', False)
+        ]
+
+        # When
+        cm = ContextManager(self.credentials)
+        cm._truncate_and_drop_add_columns('test_table', 'support', df_columns, table_columns)
+
+        # Then
+        query = mock.call_args[0][0]
+        assert ';;' not in query
+        assert query.startswith("SELECT CDB_RegenerateTable('support.test_table'::regclass); BEGIN;")
+
+
+class TestAlterTableDropAddColumnsQuery(object):
+    def test_builds_alter_table_with_drop_and_add(self):
+        drop_columns = [
+            ColumnInfo('SET', 'set', 'text', False)
+        ]
+        add_columns = [
+            ColumnInfo('SET', 'set', 'text', False),
+            ColumnInfo('SET2', 'set2', 'text', False)
+        ]
+
+        query = _alter_table_drop_add_columns_query(
+            'test_table', drop_columns, add_columns)
+
+        assert query == (
+            'ALTER TABLE test_table DROP COLUMN "set",'
+            'ADD COLUMN "set" text,ADD COLUMN "set2" text'
+        )
+
+    def test_builds_alter_table_with_only_add(self):
+        add_columns = [
+            ColumnInfo('SET2', 'set2', 'text', False)
+        ]
+
+        query = _alter_table_drop_add_columns_query(
+            'test_table', [], add_columns)
+
+        assert query == 'ALTER TABLE test_table ADD COLUMN "set2" text'
+
+    def test_builds_alter_table_with_only_drop(self):
+        drop_columns = [
+            ColumnInfo('SET', 'set', 'text', False)
+        ]
+
+        query = _alter_table_drop_add_columns_query(
+            'test_table', drop_columns, [])
+
+        assert query == 'ALTER TABLE test_table DROP COLUMN "set"'
+
+    def test_raises_if_no_operations(self):
+        with pytest.raises(ValueError) as error:
+            _alter_table_drop_add_columns_query('test_table', [], [])
+
+        assert str(error.value) == 'No columns provided to drop or add.'

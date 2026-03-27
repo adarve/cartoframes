@@ -321,16 +321,20 @@ class ContextManager:
 
     def _truncate_and_drop_add_columns(self, table_name, schema, df_columns, table_columns):
         log.debug('TRUNCATE AND DROP + ADD columns table "{}"'.format(table_name))
-        drop_columns = _drop_columns_query(table_name, table_columns)
-        add_columns = _add_columns_query(table_name, df_columns)
+        drop_add_columns = _alter_table_drop_add_columns_query(
+            table_name, table_columns, df_columns)
+        has_regenerate_table = self._check_regenerate_table_exists()
 
-        drop_add_columns = 'ALTER TABLE {table_name} {drop_columns},{add_columns};'.format(
-            table_name=table_name, drop_columns=drop_columns, add_columns=add_columns)
-
-        query = '{regenerate}; BEGIN; {truncate}; {drop_add_columns}; COMMIT;'.format(
-            regenerate=_regenerate_table_query(table_name, schema) if self._check_regenerate_table_exists() else '',
-            truncate=_truncate_table_query(table_name),
-            drop_add_columns=drop_add_columns)
+        query_parts = []
+        if has_regenerate_table:
+            query_parts.append(_regenerate_table_query(table_name, schema))
+        query_parts.extend([
+            'BEGIN',
+            _truncate_table_query(table_name),
+            drop_add_columns,
+            'COMMIT'
+        ])
+        query = '; '.join(query_parts) + ';'
 
         query_length_over_threshold = len(query) > BATCH_API_PAYLOAD_THRESHOLD
 
@@ -338,16 +342,16 @@ class ContextManager:
             qualified_func_name = self._create_function(
                 schema=schema, statement=drop_add_columns)
             drop_add_func_sql = 'SELECT {}'.format(qualified_func_name)
-            query = '''
-                {regenerate};
-                BEGIN;
-                {truncate};
-                {drop_add_func_sql};
-                COMMIT;'''.format(
-                regenerate=_regenerate_table_query(
-                    table_name, schema) if self._check_regenerate_table_exists() else '',
-                truncate=_truncate_table_query(table_name),
-                drop_add_func_sql=drop_add_func_sql)
+            query_parts = []
+            if has_regenerate_table:
+                query_parts.append(_regenerate_table_query(table_name, schema))
+            query_parts.extend([
+                'BEGIN',
+                _truncate_table_query(table_name),
+                drop_add_func_sql,
+                'COMMIT'
+            ])
+            query = '; '.join(query_parts) + ';'
         try:
             self.execute_long_running_query(query)
         finally:
@@ -504,6 +508,30 @@ def _add_columns_query(table_name, columns):
     columns = ['ADD COLUMN {name} {type}'.format(name=double_quote(c.dbname), type=c.dbtype)
                for c in columns if _not_reserved(c.dbname)]
     return ','.join(columns)
+
+
+def _alter_table_drop_add_columns_query(table_name, drop_columns, add_columns):
+    """
+    Build an ALTER TABLE statement to drop and/or add columns.
+
+    It avoids malformed SQL when one side is empty and leaves statement
+    termination to the caller, so query builders don't accidentally produce
+    duplicate semicolons.
+    """
+    operations = []
+    drop_operations = _drop_columns_query(table_name, drop_columns)
+    add_operations = _add_columns_query(table_name, add_columns)
+
+    if drop_operations:
+        operations.append(drop_operations)
+    if add_operations:
+        operations.append(add_operations)
+
+    if not operations:
+        raise ValueError('No columns provided to drop or add.')
+
+    return 'ALTER TABLE {table_name} {operations}'.format(
+        table_name=table_name, operations=','.join(operations))
 
 
 def _not_reserved(column):
