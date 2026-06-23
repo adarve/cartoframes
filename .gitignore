@@ -71,3 +71,4 @@ fake_path
 docs/build/
 docs/_static/
 docs/_templates/
+/.python-version

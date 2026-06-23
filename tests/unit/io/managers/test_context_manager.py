@@ -1,10 +1,11 @@
 from collections import namedtuple
 
 import pytest
+import requests
 
 from carto.datasets import DatasetManager
 from carto.sql import SQLClient, BatchSQLClient, CopySQLClient
-from carto.exceptions import CartoRateLimitException
+from carto.exceptions import CartoException, CartoRateLimitException
 
 from pandas import DataFrame
 from geopandas import GeoDataFrame
@@ -12,7 +13,14 @@ from cartoframes.auth import Credentials
 from cartoframes.io.managers.context_manager import (
     ContextManager,
     DEFAULT_RETRY_TIMES,
+    DEFAULT_STREAM_CHUNK_SIZE,
+    BATCH_API_PAYLOAD_THRESHOLD,
     _alter_table_drop_add_columns_query,
+    _build_copy_from_query,
+    _compute_copy_data,
+    _explicit_copy_query_length,
+    _reorder_dataframe_columns,
+    _stream_copy_data,
     retry_copy
 )
 from cartoframes.utils.columns import ColumnInfo
@@ -80,7 +88,11 @@ class TestContextManager(object):
         mock_create_table.assert_called_once_with('''
             BEGIN; CREATE TABLE table_name ("a" bigint); COMMIT;
         '''.strip())
-        mock.assert_called_once_with(df, 'table_name', columns, DEFAULT_RETRY_TIMES)
+        mock.assert_called_once()
+        assert mock.call_args[0][1] == 'table_name'
+        assert mock.call_args[0][2] == columns
+        assert mock.call_args[0][3] == DEFAULT_RETRY_TIMES
+        assert mock.call_args[1]['implicit_column_order'] is True
 
     def test_copy_from_exists_fail(self, mocker):
         # Given
@@ -104,7 +116,9 @@ class TestContextManager(object):
         mocker.patch('cartoframes.io.managers.context_manager._create_auth_client')
         mocker.patch.object(ContextManager, 'has_table', return_value=True)
         mocker.patch.object(ContextManager, 'get_schema', return_value='schema')
+        mocker.patch.object(ContextManager, '_get_query_columns_info', return_value=[])
         mock = mocker.patch.object(ContextManager, '_truncate_and_drop_add_columns')
+        mock_copy = mocker.patch.object(ContextManager, '_copy_from')
         df = DataFrame({'A': [1]})
         columns = [ColumnInfo('A', 'a', 'bigint', False)]
 
@@ -114,15 +128,24 @@ class TestContextManager(object):
 
         # Then
         mock.assert_called_once_with('table_name', 'schema', columns, [])
+        mock_copy.assert_called_once()
+        assert mock_copy.call_args[0][1] == 'table_name'
+        assert mock_copy.call_args[0][2] == columns
+        assert mock_copy.call_args[0][3] == DEFAULT_RETRY_TIMES
+        assert mock_copy.call_args[1]['implicit_column_order'] is False
 
     def test_copy_from_exists_replace_truncate(self, mocker):
         # Given
         mocker.patch('cartoframes.io.managers.context_manager._create_auth_client')
         mocker.patch.object(ContextManager, 'has_table', return_value=True)
         mocker.patch.object(ContextManager, 'get_schema', return_value='schema')
+        table_columns = [ColumnInfo('A', 'a', 'bigint', False)]
+        mocker.patch.object(ContextManager, '_get_query_columns_info', return_value=table_columns)
         mocker.patch.object(ContextManager, '_compare_columns', return_value=True)
         mock = mocker.patch.object(ContextManager, '_truncate_table')
+        mock_copy = mocker.patch.object(ContextManager, '_copy_from')
         df = DataFrame({'A': [1]})
+        columns = [ColumnInfo('A', 'a', 'bigint', False)]
 
         # When
         cm = ContextManager(self.credentials)
@@ -130,6 +153,11 @@ class TestContextManager(object):
 
         # Then
         mock.assert_called_once_with('table_name', 'schema')
+        mock_copy.assert_called_once()
+        assert mock_copy.call_args[0][1] == 'table_name'
+        assert mock_copy.call_args[0][2] == columns
+        assert mock_copy.call_args[0][3] == DEFAULT_RETRY_TIMES
+        assert mock_copy.call_args[1]['implicit_column_order'] is False
 
     def test_internal_copy_from(self, mocker):
         # Given
@@ -150,10 +178,11 @@ class TestContextManager(object):
         assert mock.call_args[0][0] == '''
             COPY table_name("a","b") FROM stdin WITH (FORMAT csv, DELIMITER '|', NULL '__null');
         '''.strip()
-        assert list(mock.call_args[0][1]) == [
-            b'1|0101000020E610000000000000000000000000000000000000\n',
+        uploaded_data = b''.join(mock.call_args[0][1])
+        assert uploaded_data == (
+            b'1|0101000020E610000000000000000000000000000000000000\n'
             b'2|0101000020E6100000000000000000F03F000000000000F03F\n'
-        ]
+        )
 
     def test_rename_table(self, mocker):
         # Given
@@ -282,7 +311,184 @@ class TestContextManager(object):
             raise CartoRateLimitException(response_mock)
 
         with pytest.raises(CartoRateLimitException):
-            test_function(retry_times=0)
+            test_function(retry_times=1)
+
+    def test_retry_copy_decorator_transient_error(self, mocker):
+        mock_sleep = mocker.patch('cartoframes.io.managers.context_manager.time.sleep')
+        attempts = {'count': 0}
+
+        @retry_copy
+        def test_function(retry_times):
+            attempts['count'] += 1
+            if attempts['count'] == 1:
+                raise requests.exceptions.ChunkedEncodingError('connection broken')
+            return 'ok'
+
+        result = test_function(retry_times=2)
+
+        assert result == 'ok'
+        assert attempts['count'] == 2
+        mock_sleep.assert_called_once()
+
+    def test_build_copy_from_query_omits_columns_when_requested(self):
+        columns = [ColumnInfo('A', 'a', 'bigint', False)]
+
+        explicit_query = _build_copy_from_query('table_name', columns, use_explicit_columns=True)
+        implicit_query = _build_copy_from_query('table_name', columns, use_explicit_columns=False)
+
+        assert '("a")' in explicit_query
+        assert '("a")' not in implicit_query
+        assert implicit_query == (
+            "COPY table_name FROM stdin WITH (FORMAT csv, DELIMITER '|', NULL '__null');")
+
+    def test_build_copy_from_query_length_scales_with_columns(self):
+        columns = [
+            ColumnInfo('col_{}'.format(i), 'col_{}'.format(i), 'text', False)
+            for i in range(1200)
+        ]
+
+        query = _build_copy_from_query('table_name', columns, use_explicit_columns=True)
+
+        assert len(query) > BATCH_API_PAYLOAD_THRESHOLD
+
+    def test_internal_copy_from_uses_implicit_query_for_wide_table(self, mocker):
+        mocker.patch('cartoframes.io.managers.context_manager._create_auth_client')
+        mock = mocker.patch.object(CopySQLClient, 'copyfrom')
+        columns = [
+            ColumnInfo('col_{}'.format(i), 'col_{}'.format(i), 'text', False)
+            for i in range(1200)
+        ]
+        df = DataFrame({column.name: ['value'] for column in columns})
+
+        cm = ContextManager(self.credentials)
+        cm._copy_from(df, 'table_name', columns, implicit_column_order=True)
+
+        assert mock.call_args[0][0] == (
+            "COPY table_name FROM stdin WITH (FORMAT csv, DELIMITER '|', NULL '__null');")
+
+    def test_stream_copy_data_splits_wide_rows(self):
+        columns = [ColumnInfo('A', 'a', 'text', False)]
+        df = DataFrame({'A': ['x' * (DEFAULT_STREAM_CHUNK_SIZE * 2)]})
+
+        row_data = b''.join(_compute_copy_data(df, columns))
+        streamed_data = b''.join(_stream_copy_data(df, columns, chunk_size=DEFAULT_STREAM_CHUNK_SIZE))
+
+        chunks = list(_stream_copy_data(df, columns, chunk_size=DEFAULT_STREAM_CHUNK_SIZE))
+        assert len(chunks) > 1
+        assert all(len(chunk) <= DEFAULT_STREAM_CHUNK_SIZE for chunk in chunks[:-1])
+        assert streamed_data == row_data
+
+    def test_copy_from_replace_recreates_wide_table(self, mocker):
+        mocker.patch('cartoframes.io.managers.context_manager._create_auth_client')
+        mocker.patch.object(ContextManager, 'has_table', return_value=True)
+        mocker.patch.object(ContextManager, 'get_schema', return_value='schema')
+        table_columns = [
+            ColumnInfo('col_{}'.format(i), 'col_{}'.format(i), 'text', False)
+            for i in range(1200)
+        ]
+        mocker.patch.object(ContextManager, '_get_query_columns_info', return_value=table_columns)
+        mocker.patch.object(ContextManager, '_compare_columns', return_value=True)
+        mock_recreate = mocker.patch.object(ContextManager, '_recreate_table_from_dataframe_columns')
+        mock_truncate = mocker.patch.object(ContextManager, '_truncate_table')
+        mock_copy = mocker.patch.object(ContextManager, '_copy_from')
+        columns = table_columns
+        df = DataFrame({column.name: ['value'] for column in columns})
+
+        cm = ContextManager(self.credentials)
+        cm.copy_from(df, 'TABLE NAME', 'replace')
+
+        mock_recreate.assert_called_once_with('table_name', 'schema', columns)
+        mock_truncate.assert_not_called()
+        assert mock_copy.call_args[1]['implicit_column_order'] is True
+
+    def test_copy_from_append_raises_for_wide_table(self, mocker):
+        mocker.patch('cartoframes.io.managers.context_manager._create_auth_client')
+        mocker.patch.object(ContextManager, 'has_table', return_value=True)
+        mocker.patch.object(ContextManager, 'get_schema', return_value='schema')
+        columns = [
+            ColumnInfo('col_{}'.format(i), 'col_{}'.format(i), 'text', False)
+            for i in range(1200)
+        ]
+        mocker.patch.object(ContextManager, '_get_query_columns_info', return_value=columns)
+        df = DataFrame({column.name: ['value'] for column in columns})
+
+        with pytest.raises(CartoException) as error:
+            cm = ContextManager(self.credentials)
+            cm.copy_from(df, 'TABLE NAME', 'append')
+
+        assert 'Cannot append a wide table' in str(error.value)
+
+    def test_retry_copy_decorator_carto_exception_wrapped_error(self, mocker):
+        mock_sleep = mocker.patch('cartoframes.io.managers.context_manager.time.sleep')
+        attempts = {'count': 0}
+
+        @retry_copy
+        def test_function(retry_times):
+            attempts['count'] += 1
+            if attempts['count'] == 1:
+                raise CartoException(requests.exceptions.ChunkedEncodingError('connection broken'))
+            return 'ok'
+
+        result = test_function(retry_times=2)
+
+        assert result == 'ok'
+        assert attempts['count'] == 2
+        mock_sleep.assert_called_once()
+
+    def test_retry_copy_decorator_read_timeout(self, mocker):
+        mock_sleep = mocker.patch('cartoframes.io.managers.context_manager.time.sleep')
+        attempts = {'count': 0}
+
+        @retry_copy
+        def test_function(retry_times):
+            attempts['count'] += 1
+            if attempts['count'] == 1:
+                raise requests.exceptions.ReadTimeout('read timed out')
+            return 'ok'
+
+        result = test_function(retry_times=2)
+
+        assert result == 'ok'
+        assert attempts['count'] == 2
+        mock_sleep.assert_called_once()
+
+    def test_retry_copy_decorator_context_wrapped_error(self, mocker):
+        mock_sleep = mocker.patch('cartoframes.io.managers.context_manager.time.sleep')
+        attempts = {'count': 0}
+
+        @retry_copy
+        def test_function(retry_times):
+            attempts['count'] += 1
+            if attempts['count'] == 1:
+                try:
+                    raise requests.exceptions.ChunkedEncodingError('connection broken')
+                except requests.exceptions.ChunkedEncodingError:
+                    raise CartoException('copy failed')
+            return 'ok'
+
+        result = test_function(retry_times=2)
+
+        assert result == 'ok'
+        assert attempts['count'] == 2
+        mock_sleep.assert_called_once()
+
+    def test_explicit_copy_query_length_matches_build_query(self):
+        columns = [ColumnInfo('A', 'a', 'bigint', False)]
+
+        assert _explicit_copy_query_length('table_name', columns) == len(
+            _build_copy_from_query('table_name', columns, use_explicit_columns=True))
+
+    def test_reorder_dataframe_columns_drops_columns_not_in_target_schema(self):
+        columns = [
+            ColumnInfo('B', 'b', 'text', False),
+            ColumnInfo('A', 'a', 'bigint', False)
+        ]
+        df = DataFrame({'A': [1], 'EXTRA': ['ignore'], 'B': ['value']})
+
+        result = _reorder_dataframe_columns(df, columns)
+
+        assert list(result.columns) == ['B', 'A']
+        assert result.iloc[0].to_dict() == {'B': 'value', 'A': 1}
 
     def test_create_table_from_query_cartodbfy(self, mocker):
         # Given

@@ -1,8 +1,10 @@
 import time
 
 import pandas as pd
+import requests
 
 from warnings import warn
+from urllib3.exceptions import ProtocolError
 
 from carto.auth import APIKeyAuthClient
 from carto.datasets import DatasetManager
@@ -22,18 +24,55 @@ from ...utils.columns import (get_dataframe_columns_info, get_query_columns_info
 
 DEFAULT_RETRY_TIMES = 3
 BATCH_API_PAYLOAD_THRESHOLD = 12000
+DEFAULT_STREAM_CHUNK_SIZE = 8192
+TRANSIENT_COPY_BACKOFF_SECONDS = 2
+TRANSIENT_COPY_MAX_BACKOFF_SECONDS = 30
+
+
+def _unwrap_transient_copy_error(err):
+    """Return the underlying transient network error, if any."""
+    transient_errors = (
+        requests.exceptions.ChunkedEncodingError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ReadTimeout,
+        ProtocolError)
+    errors_to_check = [err]
+    seen_errors = set()
+
+    while errors_to_check:
+        current = errors_to_check.pop(0)
+        if current is None or id(current) in seen_errors:
+            continue
+
+        seen_errors.add(id(current))
+
+        if isinstance(current, transient_errors):
+            return current
+
+        if isinstance(current, tuple):
+            errors_to_check.extend(current)
+            continue
+
+        if isinstance(current, CartoException) and current.args:
+            errors_to_check.extend(current.args)
+
+        errors_to_check.append(getattr(current, '__cause__', None))
+        errors_to_check.append(getattr(current, '__context__', None))
+
+    return None
 
 
 def retry_copy(func):
     def wrapper(*args, **kwargs):
         m_retry_times = kwargs.get('retry_times', DEFAULT_RETRY_TIMES)
-        while m_retry_times >= 1:
+        attempt = 0
+        while attempt < m_retry_times:
             try:
                 return func(*args, **kwargs)
             except CartoRateLimitException as err:
-                m_retry_times -= 1
+                attempt += 1
 
-                if m_retry_times <= 0:
+                if attempt >= m_retry_times:
                     warn(('Read call was rate-limited. '
                           'This usually happens when there are multiple queries being read at the same time.'))
                     raise err
@@ -41,6 +80,21 @@ def retry_copy(func):
                 warn('Read call rate limited. Waiting {s} seconds'.format(s=err.retry_after))
                 time.sleep(err.retry_after)
                 warn('Retrying...')
+            except Exception as err:
+                transient_error = _unwrap_transient_copy_error(err)
+                if transient_error is None:
+                    raise err
+
+                attempt += 1
+                if attempt >= m_retry_times:
+                    raise err
+
+                backoff = min(
+                    TRANSIENT_COPY_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+                    TRANSIENT_COPY_MAX_BACKOFF_SECONDS)
+                warn('Copy call failed with transient error: {error}. Retrying in {seconds} seconds...'.format(
+                    error=transient_error, seconds=backoff))
+                time.sleep(backoff)
         return func(*args, **kwargs)
     return wrapper
 
@@ -90,17 +144,20 @@ class ContextManager:
         schema = self.get_schema()
         table_name = self.normalize_table_name(table_name)
         df_columns = get_dataframe_columns_info(gdf)
+        implicit_column_order = False
+        copy_query_too_long = _explicit_copy_query_length(table_name, df_columns) > BATCH_API_PAYLOAD_THRESHOLD
 
         if self.has_table(table_name, schema):
-            if if_exists == 'replace':
-                table_query = self._compute_query_from_table(table_name, schema)
-                table_columns = self._get_query_columns_info(table_query)
+            table_query = self._compute_query_from_table(table_name, schema)
+            table_columns = self._get_query_columns_info(table_query)
 
-                if self._compare_columns(df_columns, table_columns):
-                    # Equal columns: truncate table
+            if if_exists == 'replace':
+                if copy_query_too_long:
+                    self._recreate_table_from_dataframe_columns(table_name, schema, df_columns)
+                    implicit_column_order = True
+                elif self._compare_columns(df_columns, table_columns):
                     self._truncate_table(table_name, schema)
                 else:
-                    # Diff columns: truncate table and drop + add columns
                     self._truncate_and_drop_add_columns(
                         table_name, schema, df_columns, table_columns)
 
@@ -110,11 +167,22 @@ class ContextManager:
                                 'if_exists="replace" to overwrite it.'.format(
                                     table_name=table_name, schema=schema))
             else:  # 'append'
+                if copy_query_too_long:
+                    raise CartoException(
+                        'Cannot append a wide table: COPY query length exceeds {} bytes. '
+                        'Use if_exists="replace" or reduce the number of columns.'.format(
+                            BATCH_API_PAYLOAD_THRESHOLD))
                 cartodbfy = False
         else:
             self._create_table_from_columns(table_name, schema, df_columns)
+            implicit_column_order = True
 
-        self._copy_from(gdf, table_name, df_columns, retry_times)
+        if implicit_column_order:
+            gdf = _reorder_dataframe_columns(gdf, df_columns)
+
+        self._copy_from(
+            gdf, table_name, df_columns, retry_times,
+            implicit_column_order=implicit_column_order)
 
         if cartodbfy is True:
             cartodbfy_query = _cartodbfy_query(table_name, schema)
@@ -313,6 +381,12 @@ class ContextManager:
             create=_create_table_from_columns_query(table_name, columns))
         self.execute_query(query)
 
+    def _recreate_table_from_dataframe_columns(self, table_name, schema, df_columns):
+        """Drop and recreate a table so implicit COPY can match dataframe column order."""
+        log.debug('RECREATE table "{}" for wide COPY upload'.format(table_name))
+        self.delete_table(table_name)
+        self._create_table_from_columns(table_name, schema, df_columns)
+
     def _truncate_table(self, table_name, schema):
         log.debug('TRUNCATE table "{}"'.format(table_name))
         query = 'BEGIN; {truncate}; COMMIT;'.format(
@@ -429,14 +503,25 @@ class ContextManager:
         return df
 
     @retry_copy
-    def _copy_from(self, dataframe, table_name, columns, retry_times=DEFAULT_RETRY_TIMES):
+    def _copy_from(self, dataframe, table_name, columns, retry_times=DEFAULT_RETRY_TIMES,
+                   implicit_column_order=False):
         log.debug('COPY FROM')
-        query = """
-            COPY {table_name}({columns}) FROM stdin WITH (FORMAT csv, DELIMITER '|', NULL '{null}');
-        """.format(
-            table_name=table_name, null=PG_NULL,
-            columns=','.join(double_quote(column.dbname) for column in columns)).strip()
-        data = _compute_copy_data(dataframe, columns)
+        explicit_query = _build_copy_from_query(table_name, columns, use_explicit_columns=True)
+        if len(explicit_query) > BATCH_API_PAYLOAD_THRESHOLD and implicit_column_order:
+            query = _build_copy_from_query(table_name, columns, use_explicit_columns=False)
+            log.warning(
+                'COPY query length is {} bytes (threshold {}); '
+                'uploading without explicit column list.'.format(
+                    len(explicit_query), BATCH_API_PAYLOAD_THRESHOLD))
+        else:
+            query = explicit_query
+            if len(explicit_query) > BATCH_API_PAYLOAD_THRESHOLD:
+                log.warning(
+                    'COPY query length is {} bytes (threshold {}); '
+                    'column order was not verified and upload may fail.'.format(
+                        len(explicit_query), BATCH_API_PAYLOAD_THRESHOLD))
+
+        data = _stream_copy_data(dataframe, columns)
 
         self.copy_client.copyfrom(query, data)
 
@@ -574,6 +659,33 @@ def _create_auth_client(credentials, public=False):
         user_agent='cartoframes_{}'.format(__version__))
 
 
+def _explicit_copy_query_length(table_name, columns):
+    """Return the byte length of the explicit-column COPY query."""
+    return len(_build_copy_from_query(table_name, columns, use_explicit_columns=True))
+
+
+def _build_copy_from_query(table_name, columns, use_explicit_columns=True):
+    """Build the COPY FROM SQL used by the CARTO copy endpoint."""
+    if use_explicit_columns and columns:
+        column_list = ','.join(double_quote(column.dbname) for column in columns)
+        return """
+            COPY {table_name}({columns}) FROM stdin WITH (FORMAT csv, DELIMITER '|', NULL '{null}');
+        """.format(
+            table_name=table_name,
+            columns=column_list,
+            null=PG_NULL).strip()
+
+    return """
+        COPY {table_name} FROM stdin WITH (FORMAT csv, DELIMITER '|', NULL '{null}');
+    """.format(table_name=table_name, null=PG_NULL).strip()
+
+
+def _reorder_dataframe_columns(dataframe, columns):
+    """Reorder dataframe columns to match the destination table column order."""
+    ordered_columns = [column.name for column in columns if column.name in dataframe.columns]
+    return dataframe[ordered_columns]
+
+
 def _compute_copy_data(df, columns):
     for index in df.index:
         row_data = []
@@ -589,3 +701,16 @@ def _compute_copy_data(df, columns):
         csv_row += b'\n'
 
         yield csv_row
+
+
+def _stream_copy_data(df, columns, chunk_size=DEFAULT_STREAM_CHUNK_SIZE):
+    """Re-buffer row-wise COPY data into fixed-size byte chunks for upload."""
+    buffer = bytearray()
+    for row in _compute_copy_data(df, columns):
+        buffer.extend(row)
+        while len(buffer) >= chunk_size:
+            yield bytes(buffer[:chunk_size])
+            del buffer[:chunk_size]
+
+    if buffer:
+        yield bytes(buffer)

@@ -2,7 +2,7 @@ import pytest
 
 import random
 
-from pandas import Index
+from pandas import DataFrame, Index
 from geopandas import GeoDataFrame
 from shapely.geometry import Point
 from shapely import wkt
@@ -10,7 +10,10 @@ from shapely import wkt
 from carto.exceptions import CartoException
 from cartoframes.auth import Credentials
 from cartoframes.io.managers.context_manager import ContextManager
-from cartoframes.io.carto import read_carto, to_carto, copy_table, create_table_from_query
+from cartoframes.io.carto import (
+    read_carto, to_carto, copy_table, create_table_from_query,
+    estimate_csv_size, _effective_max_upload_size
+)
 
 
 CREDENTIALS = Credentials('fake_user', 'fake_api_key')
@@ -378,6 +381,40 @@ def test_to_carto_chunks(mocker):
     assert cm_mock.call_args[0][1] == table_name
     assert cm_mock.call_args[0][2] in ['fail', 'append']
     assert cm_mock.call_args[0][3] is True
+    assert norm_table_name == table_name
+
+
+def test_estimate_csv_size_uses_max_row_size(mocker):
+    gdf = GeoDataFrame({
+        'value': ['a'] * 99 + ['x' * 10000]
+    })
+
+    estimated_size = estimate_csv_size(gdf)
+
+    assert estimated_size >= 10000 * len(gdf)
+
+
+def test_effective_max_upload_size_reduces_for_wide_tables():
+    gdf = GeoDataFrame({f'col_{i}': [1] for i in range(400)})
+
+    effective_size = _effective_max_upload_size(gdf, 1000000)
+
+    assert effective_size < 1000000
+
+
+def test_to_carto_chunks_wide_table(mocker):
+    table_name = '__table_name__'
+    cm_mock = mocker.patch.object(ContextManager, 'copy_from')
+    cm_mock.return_value = table_name
+
+    df = DataFrame({f'col_{i}': ['value'] for i in range(250)})
+    for _ in range(200):
+        df.loc[len(df)] = ['value'] * 250
+
+    norm_table_name = to_carto(
+        df, table_name, CREDENTIALS, max_upload_size=50000, skip_quota_warning=True)
+
+    assert cm_mock.call_count > 1
     assert norm_table_name == table_name
 
 

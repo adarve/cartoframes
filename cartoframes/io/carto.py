@@ -162,7 +162,8 @@ def to_carto(dataframe, table_name, credentials=None, if_exists='fail', geom_col
     elif isinstance(dataframe, GeoDataFrame):
         log.warning('Geometry column not found in the GeoDataFrame.')
 
-    chunk_count = math.ceil(estimate_csv_size(gdf) / max_upload_size)
+    effective_max_upload_size = _effective_max_upload_size(gdf, max_upload_size)
+    chunk_count = math.ceil(estimate_csv_size(gdf) / effective_max_upload_size)
     chunk_row_size = int(math.ceil(len(gdf) / chunk_count))
     chunked_gdf = [gdf[i:i + chunk_row_size] for i in range(0, gdf.shape[0], chunk_row_size)]
 
@@ -419,5 +420,21 @@ def update_privacy_table(table_name, privacy, credentials=None, log_enabled=True
 def estimate_csv_size(gdf):
     n = min(SAMPLE_ROWS_NUMBER, len(gdf))
     columns = get_dataframe_columns_info(gdf)
-    return sum([len(x) for x in
-                _compute_copy_data(gdf.sample(n=n), columns)]) * len(gdf) / n
+    row_sizes = [len(x) for x in _compute_copy_data(gdf.sample(n=n), columns)]
+    if not row_sizes:
+        return 0
+
+    total_sample_size = sum(row_sizes)
+    max_row_size = max(row_sizes)
+    estimated_total = total_sample_size * len(gdf) / n
+    return max(estimated_total, max_row_size * len(gdf))
+
+
+def _effective_max_upload_size(gdf, max_upload_size):
+    """Reduce upload chunk size for very wide tables to avoid request timeouts."""
+    num_columns = len(get_dataframe_columns_info(gdf))
+    if num_columns <= 100:
+        return max_upload_size
+
+    column_factor = min(1.0, 100 / float(num_columns))
+    return max(int(max_upload_size * column_factor), 1)
