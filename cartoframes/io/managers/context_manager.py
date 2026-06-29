@@ -24,6 +24,7 @@ from ...utils.columns import (get_dataframe_columns_info, get_query_columns_info
 
 DEFAULT_RETRY_TIMES = 3
 BATCH_API_PAYLOAD_THRESHOLD = 12000
+WIDE_COPY_COLUMN_THRESHOLD = 100
 DEFAULT_STREAM_CHUNK_SIZE = 8192
 TRANSIENT_COPY_BACKOFF_SECONDS = 2
 TRANSIENT_COPY_MAX_BACKOFF_SECONDS = 30
@@ -145,14 +146,14 @@ class ContextManager:
         table_name = self.normalize_table_name(table_name)
         df_columns = get_dataframe_columns_info(gdf)
         implicit_column_order = False
-        copy_query_too_long = _explicit_copy_query_length(table_name, df_columns) > BATCH_API_PAYLOAD_THRESHOLD
+        wide_copy = _is_wide_copy(table_name, df_columns)
 
         if self.has_table(table_name, schema):
             table_query = self._compute_query_from_table(table_name, schema)
             table_columns = self._get_query_columns_info(table_query)
 
             if if_exists == 'replace':
-                if copy_query_too_long:
+                if wide_copy:
                     self._recreate_table_from_dataframe_columns(table_name, schema, df_columns)
                     implicit_column_order = True
                 elif self._compare_columns(df_columns, table_columns):
@@ -167,11 +168,12 @@ class ContextManager:
                                 'if_exists="replace" to overwrite it.'.format(
                                     table_name=table_name, schema=schema))
             else:  # 'append'
-                if copy_query_too_long:
+                if wide_copy:
                     raise CartoException(
-                        'Cannot append a wide table: COPY query length exceeds {} bytes. '
+                        'Cannot append a wide table: COPY query length exceeds {} bytes '
+                        'or table has more than {} columns. '
                         'Use if_exists="replace" or reduce the number of columns.'.format(
-                            BATCH_API_PAYLOAD_THRESHOLD))
+                            BATCH_API_PAYLOAD_THRESHOLD, WIDE_COPY_COLUMN_THRESHOLD))
                 cartodbfy = False
         else:
             self._create_table_from_columns(table_name, schema, df_columns)
@@ -507,19 +509,23 @@ class ContextManager:
                    implicit_column_order=False):
         log.debug('COPY FROM')
         explicit_query = _build_copy_from_query(table_name, columns, use_explicit_columns=True)
-        if len(explicit_query) > BATCH_API_PAYLOAD_THRESHOLD and implicit_column_order:
+        if _is_wide_copy(table_name, columns) and implicit_column_order:
             query = _build_copy_from_query(table_name, columns, use_explicit_columns=False)
             log.warning(
-                'COPY query length is {} bytes (threshold {}); '
+                'COPY query length is {} bytes (threshold {}) and column count is {} '
+                '(threshold {}); '
                 'uploading without explicit column list.'.format(
-                    len(explicit_query), BATCH_API_PAYLOAD_THRESHOLD))
+                    len(explicit_query), BATCH_API_PAYLOAD_THRESHOLD,
+                    len(columns), WIDE_COPY_COLUMN_THRESHOLD))
         else:
             query = explicit_query
-            if len(explicit_query) > BATCH_API_PAYLOAD_THRESHOLD:
+            if _is_wide_copy(table_name, columns):
                 log.warning(
-                    'COPY query length is {} bytes (threshold {}); '
+                    'COPY query length is {} bytes (threshold {}) and column count is {} '
+                    '(threshold {}); '
                     'column order was not verified and upload may fail.'.format(
-                        len(explicit_query), BATCH_API_PAYLOAD_THRESHOLD))
+                        len(explicit_query), BATCH_API_PAYLOAD_THRESHOLD,
+                        len(columns), WIDE_COPY_COLUMN_THRESHOLD))
 
         data = _stream_copy_data(dataframe, columns)
 
@@ -662,6 +668,13 @@ def _create_auth_client(credentials, public=False):
 def _explicit_copy_query_length(table_name, columns):
     """Return the byte length of the explicit-column COPY query."""
     return len(_build_copy_from_query(table_name, columns, use_explicit_columns=True))
+
+
+def _is_wide_copy(table_name, columns):
+    """Return whether COPY should avoid explicit-column query parameters."""
+    return (
+        len(columns) > WIDE_COPY_COLUMN_THRESHOLD or
+        _explicit_copy_query_length(table_name, columns) > BATCH_API_PAYLOAD_THRESHOLD)
 
 
 def _build_copy_from_query(table_name, columns, use_explicit_columns=True):

@@ -15,10 +15,12 @@ from cartoframes.io.managers.context_manager import (
     DEFAULT_RETRY_TIMES,
     DEFAULT_STREAM_CHUNK_SIZE,
     BATCH_API_PAYLOAD_THRESHOLD,
+    WIDE_COPY_COLUMN_THRESHOLD,
     _alter_table_drop_add_columns_query,
     _build_copy_from_query,
     _compute_copy_data,
     _explicit_copy_query_length,
+    _is_wide_copy,
     _reorder_dataframe_columns,
     _stream_copy_data,
     retry_copy
@@ -351,12 +353,36 @@ class TestContextManager(object):
 
         assert len(query) > BATCH_API_PAYLOAD_THRESHOLD
 
+    def test_is_wide_copy_detects_column_count_threshold(self):
+        columns = [
+            ColumnInfo('col_{}'.format(i), 'col_{}'.format(i), 'text', False)
+            for i in range(WIDE_COPY_COLUMN_THRESHOLD + 1)
+        ]
+
+        assert _explicit_copy_query_length('table_name', columns) < BATCH_API_PAYLOAD_THRESHOLD
+        assert _is_wide_copy('table_name', columns) is True
+
     def test_internal_copy_from_uses_implicit_query_for_wide_table(self, mocker):
         mocker.patch('cartoframes.io.managers.context_manager._create_auth_client')
         mock = mocker.patch.object(CopySQLClient, 'copyfrom')
         columns = [
             ColumnInfo('col_{}'.format(i), 'col_{}'.format(i), 'text', False)
             for i in range(1200)
+        ]
+        df = DataFrame({column.name: ['value'] for column in columns})
+
+        cm = ContextManager(self.credentials)
+        cm._copy_from(df, 'table_name', columns, implicit_column_order=True)
+
+        assert mock.call_args[0][0] == (
+            "COPY table_name FROM stdin WITH (FORMAT csv, DELIMITER '|', NULL '__null');")
+
+    def test_internal_copy_from_uses_implicit_query_for_many_columns(self, mocker):
+        mocker.patch('cartoframes.io.managers.context_manager._create_auth_client')
+        mock = mocker.patch.object(CopySQLClient, 'copyfrom')
+        columns = [
+            ColumnInfo('col_{}'.format(i), 'col_{}'.format(i), 'text', False)
+            for i in range(WIDE_COPY_COLUMN_THRESHOLD + 1)
         ]
         df = DataFrame({column.name: ['value'] for column in columns})
 
@@ -385,6 +411,29 @@ class TestContextManager(object):
         table_columns = [
             ColumnInfo('col_{}'.format(i), 'col_{}'.format(i), 'text', False)
             for i in range(1200)
+        ]
+        mocker.patch.object(ContextManager, '_get_query_columns_info', return_value=table_columns)
+        mocker.patch.object(ContextManager, '_compare_columns', return_value=True)
+        mock_recreate = mocker.patch.object(ContextManager, '_recreate_table_from_dataframe_columns')
+        mock_truncate = mocker.patch.object(ContextManager, '_truncate_table')
+        mock_copy = mocker.patch.object(ContextManager, '_copy_from')
+        columns = table_columns
+        df = DataFrame({column.name: ['value'] for column in columns})
+
+        cm = ContextManager(self.credentials)
+        cm.copy_from(df, 'TABLE NAME', 'replace')
+
+        mock_recreate.assert_called_once_with('table_name', 'schema', columns)
+        mock_truncate.assert_not_called()
+        assert mock_copy.call_args[1]['implicit_column_order'] is True
+
+    def test_copy_from_replace_recreates_many_column_table(self, mocker):
+        mocker.patch('cartoframes.io.managers.context_manager._create_auth_client')
+        mocker.patch.object(ContextManager, 'has_table', return_value=True)
+        mocker.patch.object(ContextManager, 'get_schema', return_value='schema')
+        table_columns = [
+            ColumnInfo('col_{}'.format(i), 'col_{}'.format(i), 'text', False)
+            for i in range(WIDE_COPY_COLUMN_THRESHOLD + 1)
         ]
         mocker.patch.object(ContextManager, '_get_query_columns_info', return_value=table_columns)
         mocker.patch.object(ContextManager, '_compare_columns', return_value=True)
