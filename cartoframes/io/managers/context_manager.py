@@ -65,7 +65,7 @@ def _unwrap_transient_copy_error(err):
 
 def retry_copy(func):
     def wrapper(*args, **kwargs):
-        m_retry_times = kwargs.get('retry_times', DEFAULT_RETRY_TIMES)
+        m_retry_times = _retry_times_from_call(func, args, kwargs)
         attempt = 0
         while attempt < m_retry_times:
             try:
@@ -98,6 +98,22 @@ def retry_copy(func):
                 time.sleep(backoff)
         return func(*args, **kwargs)
     return wrapper
+
+
+def _retry_times_from_call(func, args, kwargs):
+    """Return retry_times whether it was passed positionally or by keyword."""
+    if 'retry_times' in kwargs:
+        return kwargs['retry_times']
+
+    try:
+        retry_index = func.__code__.co_varnames.index('retry_times')
+    except ValueError:
+        return DEFAULT_RETRY_TIMES
+
+    if len(args) > retry_index:
+        return args[retry_index]
+
+    return DEFAULT_RETRY_TIMES
 
 
 def not_found(func):
@@ -571,6 +587,7 @@ def _create_function_query(schema, function_name, statement, columns_types, retu
     columns_types = columns_types or {}
     columns = ['{0} {1}'.format(cname, ctype) for cname, ctype in columns_types.items()]
     columns_str = ','.join(columns) if columns else ''
+    statement = statement.rstrip().rstrip(';') + ';'
     function_query = '''
         CREATE FUNCTION {schema}.{function_name}({columns_str})
         RETURNS {return_value} AS $$

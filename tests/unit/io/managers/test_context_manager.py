@@ -19,6 +19,7 @@ from cartoframes.io.managers.context_manager import (
     _alter_table_drop_add_columns_query,
     _build_copy_from_query,
     _compute_copy_data,
+    _create_function_query,
     _explicit_copy_query_length,
     _is_wide_copy,
     _reorder_dataframe_columns,
@@ -332,6 +333,21 @@ class TestContextManager(object):
         assert attempts['count'] == 2
         mock_sleep.assert_called_once()
 
+    def test_retry_copy_decorator_honors_positional_retry_times(self, mocker):
+        mock_sleep = mocker.patch('cartoframes.io.managers.context_manager.time.sleep')
+        attempts = {'count': 0}
+
+        @retry_copy
+        def test_function(value, retry_times=DEFAULT_RETRY_TIMES):
+            attempts['count'] += 1
+            raise requests.exceptions.ChunkedEncodingError(value)
+
+        with pytest.raises(requests.exceptions.ChunkedEncodingError):
+            test_function('connection broken', 1)
+
+        assert attempts['count'] == 1
+        mock_sleep.assert_not_called()
+
     def test_build_copy_from_query_omits_columns_when_requested(self):
         columns = [ColumnInfo('A', 'a', 'bigint', False)]
 
@@ -631,3 +647,17 @@ class TestAlterTableDropAddColumnsQuery(object):
             _alter_table_drop_add_columns_query('test_table', [], [])
 
         assert str(error.value) == 'No columns provided to drop or add.'
+
+
+class TestCreateFunctionQuery(object):
+    def test_adds_statement_semicolon_before_plpgsql_end(self):
+        query, qualified_func_name = _create_function_query(
+            schema='"support"',
+            function_name='tmp_func',
+            statement='ALTER TABLE test_table ADD COLUMN "set2" text',
+            columns_types={},
+            return_value='VOID',
+            language='plpgsql')
+
+        assert 'ALTER TABLE test_table ADD COLUMN "set2" text;\n        END;' in query
+        assert qualified_func_name == '"support".tmp_func()'
